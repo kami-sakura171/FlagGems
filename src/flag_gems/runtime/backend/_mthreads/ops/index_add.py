@@ -17,12 +17,12 @@ import logging
 import triton
 import triton.language as tl
 
+logger = logging.getLogger(__name__)
+
 from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
 from flag_gems.utils import dim_compress, libentry
 from flag_gems.utils import triton_lang_extension as ext
-
-logger = logging.getLogger(__name__)
 
 
 @libentry()
@@ -88,9 +88,9 @@ def index_add(inp, dim, index, src, alpha=1):
     self.index_add_(dim, index, source, alpha=1) -> Tensor
 
     For a 3-D tensor the output is:
-        self[index[i], :, :] += alpha * src[i, :, :]  # if dim == 0
-        self[:, index[i], :] += alpha * src[:, i, :]  # if dim == 1
-        self[:, :, index[i]] += alpha * src[:, :, i]  # if dim == 2
+    self[index[i], :, :] += alpha * src[i, :, :]  # if dim == 0
+    self[:, index[i], :] += alpha * src[:, i, :]  # if dim == 1
+    self[:, :, index[i]] += alpha * src[:, :, i]  # if dim == 2
     """
     logger.debug("GEMS_MTHREADS INDEX_ADD")
 
