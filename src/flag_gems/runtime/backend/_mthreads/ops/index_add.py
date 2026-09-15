@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import logging
-
+import torch
 import triton
 import triton.language as tl
 
@@ -36,7 +36,6 @@ def index_add_kernel(
     N,
     alpha,
     inp_len,
-    IS_BF16: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
@@ -44,18 +43,15 @@ def index_add_kernel(
     Kernel for index_add operation with autotune.
 
     After dim_compress, tensors are reshaped so that:
-    - inp has shape (M, inp_len) where inp_len is the size of target dimension
+    - inp/out has shape (M, inp_len) where inp_len is the size of target dimension
     - src has shape (M, N) where N is the size of index
 
     For each row m and each index position n:
         out[m, index[n]] += alpha * src[m, n]
 
-    IS_BF16 dispatches between atomic_add (default) and load+store.
-    The MUSA mp_31 LLVM backend cannot lower AtomicLoadFAdd for bf16
-    (raises "Cannot select: bf16,ch = AtomicLoadFAdd<...>"), while fp16
-    is supported. So bf16 falls back to load+add+store. Cross-program
-    atomicity is sacrificed, which is acceptable when `index` has no
-    duplicates (typical test cases).
+    Uses tl.atomic_add for all dtypes. For bf16, the Python layer casts to
+    fp32 before kernel launch and casts back after, so the kernel always
+    operates on fp32 atomic_add (supported by MUSA LLVM backend).
     """
     pid_m = ext.program_id(axis=0)
     pid_n = ext.program_id(axis=1)
@@ -81,14 +77,8 @@ def index_add_kernel(
     # Load source values
     cur_src = tl.load(src_ptr + src_off, mask=block_mask, other=0.0)
 
-    if IS_BF16:
-        # Load+add+store fallback for bf16 (MUSA LLVM atomic unsupported).
-        cur_out = tl.load(out_ptr + inp_off, mask=block_mask, other=0.0)
-        tl.store(out_ptr + inp_off, cur_out + alpha * cur_src, mask=block_mask)
-    else:
-        # atomic_add handles repeated indices in `index` correctly,
-        # including fp16 (supported) and float/int (always supported).
-        tl.atomic_add(out_ptr + inp_off, alpha * cur_src, mask=block_mask)
+    # atomic_add for all dtypes (bf16 is handled by Python-layer cast to fp32)
+    tl.atomic_add(out_ptr + inp_off, alpha * cur_src, mask=block_mask)
 
 
 def index_add(inp, dim, index, src, alpha=1):
@@ -104,21 +94,13 @@ def index_add(inp, dim, index, src, alpha=1):
     """
     logger.debug("GEMS_MTHREADS INDEX_ADD")
 
-    # Make inputs contiguous
-    inp = inp.contiguous()
-    index = index.contiguous()
-    src = src.contiguous()
-
     # Normalize dimension
     dim = dim % inp.ndim
     inp_len = inp.size(dim)
     N = index.numel()
     M = src.numel() // N
 
-    # Bounds check: the common op (src/flag_gems/ops/index_add.py) performs this
-    # inside the Triton kernel. Other backends (kunlunxin, ascend, cambricon) do
-    # it in Python instead, which we follow here.
-    # Use min/max to avoid allocating full-size boolean tensors.
+    # Bounds check: use min/max to avoid allocating full-size boolean tensors.
     idx_min = index.min().item()
     idx_max = index.max().item()
     assert idx_min >= 0 and idx_max < inp_len, "0 <= index < self.size(dim)"
@@ -132,18 +114,31 @@ def index_add(inp, dim, index, src, alpha=1):
     # Clone input for output
     out = inp.clone()
 
+    # Cast bf16 to fp32 so the kernel can use atomic_add (MUSA supports fp32 atomic).
+    # After kernel completes, cast back to original dtype.
+    orig_dtype = out.dtype
+    needs_cast = orig_dtype == torch.bfloat16
+    if needs_cast:
+        out = out.to(torch.float32)
+        src = src.to(torch.float32)
+
+    # Make inputs contiguous
+    out = out.contiguous()
+    index = index.contiguous()
+    src = src.contiguous()
+
     # Calculate grid with autotune
     grid = lambda meta: (
         triton.cdiv(M, meta["BLOCK_M"]),
         triton.cdiv(N, meta["BLOCK_N"]),
     )
 
-    is_bf16 = inp.dtype == torch.bfloat16
-
     with torch_device_fn.device(inp.device):
-        index_add_kernel[grid](
-            out, index, src, M, N, alpha, inp_len, is_bf16
-        )
+        index_add_kernel[grid](out, index, src, M, N, alpha, inp_len)
+
+    # Cast back to original dtype if needed
+    if needs_cast:
+        out = out.to(orig_dtype)
 
     # Restore original dimension order if needed
     if dim != final_dim:
@@ -160,23 +155,20 @@ def index_add_(inp, dim, index, src, alpha=1):
     """
     logger.debug("GEMS_MTHREADS INDEX_ADD_")
 
-    # Make index and src contiguous
-    index = index.contiguous()
-    src = src.contiguous()
-
     # Normalize dimension
     dim = dim % inp.ndim
     inp_len = inp.size(dim)
     N = index.numel()
     M = src.numel() // N
 
-    # Bounds check: the common op (src/flag_gems/ops/index_add.py) performs this
-    # inside the Triton kernel. Other backends (kunlunxin, ascend, cambricon) do
-    # it in Python instead, which we follow here.
-    # Use min/max to avoid allocating full-size boolean tensors.
+    # Bounds check: use min/max to avoid allocating full-size boolean tensors.
     idx_min = index.min().item()
     idx_max = index.max().item()
     assert idx_min >= 0 and idx_max < inp_len, "0 <= index < self.size(dim)"
+
+    # Cast bf16 to fp32 so the kernel can use atomic_add (MUSA supports fp32 atomic).
+    orig_dtype = inp.dtype
+    needs_cast = orig_dtype == torch.bfloat16
 
     # Move target dim to last position
     final_dim = inp.ndim - 1
@@ -186,18 +178,26 @@ def index_add_(inp, dim, index, src, alpha=1):
         inp_work = dim_compress(inp.clone().contiguous(), dim)
         src_work = dim_compress(src, dim)
 
+        if needs_cast:
+            inp_work = inp_work.to(torch.float32)
+            src_work = src_work.to(torch.float32)
+
+        # Make contiguous
+        inp_work = inp_work.contiguous()
+        src_work = src_work.contiguous()
+
         # Calculate grid with autotune
         grid = lambda meta: (
             triton.cdiv(M, meta["BLOCK_M"]),
             triton.cdiv(N, meta["BLOCK_N"]),
         )
 
-        is_bf16 = inp_work.dtype == torch.bfloat16
-
         with torch_device_fn.device(inp.device):
-            index_add_kernel[grid](
-                inp_work, index, src_work, M, N, alpha, inp_len, is_bf16
-            )
+            index_add_kernel[grid](inp_work, index, src_work, M, N, alpha, inp_len)
+
+        # Cast back to original dtype if needed
+        if needs_cast:
+            inp_work = inp_work.to(orig_dtype)
 
         # Restore original dimension order and copy back
         order = list(range(inp_work.ndim - 1))
@@ -207,6 +207,11 @@ def index_add_(inp, dim, index, src, alpha=1):
     else:
         # Can work directly on input if already contiguous
         inp_contig = inp.contiguous()
+        src_contig = src.contiguous()
+
+        if needs_cast:
+            inp_contig = inp_contig.to(torch.float32)
+            src_contig = src_contig.to(torch.float32)
 
         # Calculate grid with autotune
         grid = lambda meta: (
@@ -214,12 +219,12 @@ def index_add_(inp, dim, index, src, alpha=1):
             triton.cdiv(N, meta["BLOCK_N"]),
         )
 
-        is_bf16 = inp_contig.dtype == torch.bfloat16
-
         with torch_device_fn.device(inp.device):
-            index_add_kernel[grid](
-                inp_contig, index, src, M, N, alpha, inp_len, is_bf16
-            )
+            index_add_kernel[grid](inp_contig, index, src_contig, M, N, alpha, inp_len)
+
+        # Cast back to original dtype if needed
+        if needs_cast:
+            inp_contig = inp_contig.to(orig_dtype)
 
         # Copy back if input wasn't contiguous
         if not inp.is_contiguous():
