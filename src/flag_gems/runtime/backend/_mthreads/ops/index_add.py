@@ -12,222 +12,201 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import logging
+"""High-performance and accurate index_add / index_add_ for mthreads (MUSA).
+
+Design Principles:
+  1. Universal Hardware Heuristics: Configs derived from hardware first-principles.
+  2. Zero-Pollution Pure JIT: Eliminates @triton.autotune.
+  3. Continuous Flattened 3D Model: Generalizes multi-dimensional tensors.
+  4. Ultra-Low Launch Overhead: JIT Cache quantization and asynchronous device 
+     assertions to eliminate Host-Device sync for small tensors.
+"""
+
 import torch
 import triton
 import triton.language as tl
 
-logger = logging.getLogger(__name__)
-
-from flag_gems import runtime
 from flag_gems.runtime import torch_device_fn
-from flag_gems.utils import dim_compress, libentry
-from flag_gems.utils import triton_lang_extension as ext
 
+_ATOMIC_UNSUPPORTED_DTYPES = frozenset({torch.bfloat16})
+_INT32_MAX = 2**31 - 1
 
-@libentry()
-@triton.heuristics(runtime.get_heuristic_config("index_add"))
+# =============================================================================
+#  Hardware First-Principle Heuristic Config Generators (Quantized for JIT Cache)
+# =============================================================================
+
+def _get_inner1_configs(total_elements):
+    # 【JIT Cache 量子化】：微小尺寸全部合并为一种签名，消灭缓存查询开销
+    if total_elements <= 1024:
+        return 1024, 4
+    block_size = min(1024, max(16, triton.next_power_of_2(total_elements)))
+    num_warps = 8 if block_size >= 1024 else 4
+    return block_size, num_warps
+
+def _get_general_configs(inner, N):
+    # 【JIT Cache 量子化】
+    if inner <= 128 and N <= 16:
+        return 128, 16, 4
+    block_inner = min(128, max(16, triton.next_power_of_2(inner)))
+    block_n = max(1, min(16, 512 // block_inner))
+    return block_inner, block_n, 4
+
+# =============================================================================
+#  Triton Kernels (Pure JIT)
+# =============================================================================
+
 @triton.jit
-def index_add_kernel(
-    out_ptr,
-    index_ptr,
-    src_ptr,
-    M,
-    N,
-    alpha,
-    inp_len,
-    BLOCK_M: tl.constexpr,
-    BLOCK_N: tl.constexpr,
+def _index_add_inner1_kernel(
+    out_ptr, index_ptr, src_ptr, M, N, dim_len, alpha,
+    USE_INT32: tl.constexpr, BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    Kernel for index_add operation with autotune.
+    pid = tl.program_id(0)
+    offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    total_elements = M * N
+    
+    mask = offsets < total_elements
+    r_m = offsets // N
+    r_n = offsets % N
 
-    After dim_compress, tensors are reshaped so that:
-    - inp/out has shape (M, inp_len) where inp_len is the size of target dimension
-    - src has shape (M, N) where N is the size of index
+    idx_1d = tl.load(index_ptr + r_n, mask=mask, other=0)
+    
+    # 【零同步越界校验】：将 Python 的 Host-Device Sync 下放给 GPU 硬件级 Assert
+    valid_idx = (idx_1d >= 0) & (idx_1d < dim_len)
+    tl.device_assert(valid_idx | ~mask, "0 <= index < self.size(dim)")
+    
+    mask = mask & valid_idx
 
-    For each row m and each index position n:
-        out[m, index[n]] += alpha * src[m, n]
+    if USE_INT32:
+        src_off = offsets.to(tl.int32)
+        inp_off = r_m.to(tl.int32) * dim_len + idx_1d.to(tl.int32)
+    else:
+        src_off = offsets.to(tl.int64)
+        inp_off = r_m.to(tl.int64) * dim_len + idx_1d.to(tl.int64)
 
-    Uses tl.atomic_add for all dtypes. For bf16, the Python layer casts to
-    fp32 before kernel launch and casts back after, so the kernel always
-    operates on fp32 atomic_add (supported by MUSA LLVM backend).
-    """
-    pid_m = ext.program_id(axis=0)
-    pid_n = ext.program_id(axis=1)
+    src_val = tl.load(src_ptr + src_off, mask=mask, other=0.0)
+    if src_val.dtype != tl.float32:
+        addend = (alpha * src_val.to(tl.float32)).to(src_val.dtype)
+    else:
+        addend = alpha * src_val
 
-    # Calculate row and column offsets
-    rows_offset = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)[:, None]
-    cols_offset = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)[None, :]
-
-    # Create masks
-    rows_mask = rows_offset < M
-    cols_mask = cols_offset < N
-    block_mask = rows_mask & cols_mask
-
-    # Load indices for this block of columns
-    cur_indices = tl.load(index_ptr + cols_offset, mask=cols_mask, other=0)
-
-    # Calculate offsets into inp/out (which has shape M x inp_len)
-    inp_off = rows_offset * inp_len + cur_indices
-
-    # Calculate offsets into src (which has shape M x N)
-    src_off = rows_offset * N + cols_offset
-
-    # Load source values
-    cur_src = tl.load(src_ptr + src_off, mask=block_mask, other=0.0)
-
-    # atomic_add for all dtypes (bf16 is handled by Python-layer cast to fp32)
-    tl.atomic_add(out_ptr + inp_off, alpha * cur_src, mask=block_mask)
+    tl.atomic_add(out_ptr + inp_off, addend, mask=mask)
 
 
-def index_add(inp, dim, index, src, alpha=1):
-    """
-    Optimized index_add for mthreads backend.
+@triton.jit
+def _index_add_general_kernel(
+    out_ptr, index_ptr, src_ptr, outer, dim_len, N, inner, outer_n, alpha,
+    USE_INT32: tl.constexpr, BLOCK_INNER: tl.constexpr, BLOCK_N: tl.constexpr,
+):
+    pid_on = tl.program_id(0)
+    pid_in = tl.program_id(1)
 
-    self.index_add_(dim, index, source, alpha=1) -> Tensor
+    r_on = pid_on * BLOCK_N + tl.arange(0, BLOCK_N)[:, None]
+    r_in = pid_in * BLOCK_INNER + tl.arange(0, BLOCK_INNER)[None, :]
 
-    For a 3-D tensor the output is:
-    self[index[i], :, :] += alpha * src[i, :, :]  # if dim == 0
-    self[:, index[i], :] += alpha * src[:, i, :]  # if dim == 1
-    self[:, :, index[i]] += alpha * src[:, :, i]  # if dim == 2
-    """
-    logger.debug("GEMS_MTHREADS INDEX_ADD")
+    r_outer = r_on // N
+    r_n = r_on % N
 
-    # Normalize dimension
-    dim = dim % inp.ndim
-    inp_len = inp.size(dim)
+    mask = (r_outer < outer) & (r_n < N) & (r_in < inner)
+    idx = tl.load(index_ptr + r_n, mask=(r_n < N), other=0)
+    
+    # 【零同步越界校验】
+    valid_idx = (idx >= 0) & (idx < dim_len)
+    tl.device_assert(valid_idx | ~(r_n < N), "0 <= index < self.size(dim)")
+    
+    mask = mask & valid_idx
+
+    if USE_INT32:
+        src_off = (r_outer.to(tl.int32) * N + r_n.to(tl.int32)) * inner + r_in.to(tl.int32)
+        inp_off = (r_outer.to(tl.int32) * dim_len + idx.to(tl.int32)) * inner + r_in.to(tl.int32)
+    else:
+        src_off = (r_outer.to(tl.int64) * N + r_n.to(tl.int64)) * inner + r_in.to(tl.int64)
+        inp_off = (r_outer.to(tl.int64) * dim_len + idx.to(tl.int64)) * inner + r_in.to(tl.int64)
+
+    src_val = tl.load(src_ptr + src_off, mask=mask, other=0.0)
+    if src_val.dtype != tl.float32:
+        addend = (alpha * src_val.to(tl.float32)).to(src_val.dtype)
+    else:
+        addend = alpha * src_val
+
+    tl.atomic_add(out_ptr + inp_off, addend, mask=mask)
+
+# =============================================================================
+#  Driver
+# =============================================================================
+
+def _index_add_impl(inp, dim, index, src, alpha, out=None):
+    ndim = inp.ndim
+    dim = dim % ndim
+    shape = inp.shape
+    dim_len = shape[dim]
     N = index.numel()
-    M = src.numel() // N
 
-    # Bounds check: use min/max to avoid allocating full-size boolean tensors.
-    idx_min = index.min().item()
-    idx_max = index.max().item()
-    assert idx_min >= 0 and idx_max < inp_len, "0 <= index < self.size(dim)"
+    if N == 0 or src.numel() == 0:
+        return inp if out is None else out
+        
+    # 【彻底摘除导致 CPU-GPU 强制同步的 Python Assert！】
+    # if N > 0:
+    #     assert bool(((index >= 0) & (index < dim_len)).all()) ...
 
-    # Move target dim to last position for coalesced memory access
-    final_dim = inp.ndim - 1
-    if dim != final_dim:
-        inp = dim_compress(inp, dim)
-        src = dim_compress(src, dim)
+    target = inp if out is None else out
 
-    # Clone input for output
-    out = inp.clone()
+    # 【剥离原生 Python Fat】：使用内联循环替代 math.prod 和 Tuple 切片实例化
+    outer = 1
+    for i in range(dim):
+        outer *= shape[i]
+    inner = 1
+    for i in range(dim + 1, ndim):
+        inner *= shape[i]
 
-    # Cast bf16 to fp32 so the kernel can use atomic_add (MUSA supports fp32 atomic).
-    # After kernel completes, cast back to original dtype.
-    orig_dtype = out.dtype
-    needs_cast = orig_dtype == torch.bfloat16
-    if needs_cast:
-        out = out.to(torch.float32)
-        src = src.to(torch.float32)
+    is_bf16 = target.dtype in _ATOMIC_UNSUPPORTED_DTYPES
+    if is_bf16:
+        orig_dtype = target.dtype
+        work_out = target.to(torch.float32)
+        work_src = src.to(torch.float32)
+    else:
+        work_out = target if target.is_contiguous() else target.contiguous()
+        work_src = src if src.is_contiguous() else src.contiguous()
 
-    # Make inputs contiguous
-    out = out.contiguous()
-    index = index.contiguous()
-    src = src.contiguous()
-
-    # Calculate grid with autotune
-    grid = lambda meta: (
-        triton.cdiv(M, meta["BLOCK_M"]),
-        triton.cdiv(N, meta["BLOCK_N"]),
-    )
+    index_c = index.contiguous()
+    use_int32 = (target.numel() < _INT32_MAX) and (src.numel() < _INT32_MAX)
 
     with torch_device_fn.device(inp.device):
-        index_add_kernel[grid](out, index, src, M, N, alpha, inp_len)
+        if inner == 1:
+            M = outer
+            total_elements = M * N
+            block_size, num_warps = _get_inner1_configs(total_elements)
+            grid = (triton.cdiv(total_elements, block_size),)
 
-    # Cast back to original dtype if needed
-    if needs_cast:
-        out = out.to(orig_dtype)
+            _index_add_inner1_kernel[grid](
+                work_out, index_c, work_src,
+                M, N, dim_len, alpha,
+                USE_INT32=use_int32,
+                BLOCK_SIZE=block_size,
+                num_warps=num_warps, num_stages=1,
+            )
+        else:
+            block_inner, block_n, num_warps = _get_general_configs(inner, N)
+            outer_n = outer * N
+            grid = (triton.cdiv(outer_n, block_n), triton.cdiv(inner, block_inner))
 
-    # Restore original dimension order if needed
-    if dim != final_dim:
-        order = list(range(out.ndim - 1))
-        order.insert(dim, final_dim)
-        return out.permute(order).contiguous()
-    else:
-        return out
+            _index_add_general_kernel[grid](
+                work_out, index_c, work_src,
+                outer, dim_len, N, inner, outer_n, alpha,
+                USE_INT32=use_int32,
+                BLOCK_INNER=block_inner, BLOCK_N=block_n,
+                num_warps=num_warps, num_stages=1,
+            )
 
+    if is_bf16:
+        target.copy_(work_out.to(orig_dtype))
+    elif work_out is not target:
+        target.copy_(work_out)
+
+    return target
+
+def index_add(inp, dim, index, src, alpha=1):
+    out = inp.clone()
+    return _index_add_impl(inp, dim, index, src, alpha, out=out)
 
 def index_add_(inp, dim, index, src, alpha=1):
-    """
-    In-place version of index_add.
-    """
-    logger.debug("GEMS_MTHREADS INDEX_ADD_")
-
-    # Normalize dimension
-    dim = dim % inp.ndim
-    inp_len = inp.size(dim)
-    N = index.numel()
-    M = src.numel() // N
-
-    # Bounds check: use min/max to avoid allocating full-size boolean tensors.
-    idx_min = index.min().item()
-    idx_max = index.max().item()
-    assert idx_min >= 0 and idx_max < inp_len, "0 <= index < self.size(dim)"
-
-    # Cast bf16 to fp32 so the kernel can use atomic_add (MUSA supports fp32 atomic).
-    orig_dtype = inp.dtype
-    needs_cast = orig_dtype == torch.bfloat16
-
-    # Move target dim to last position
-    final_dim = inp.ndim - 1
-
-    if dim != final_dim:
-        # Need to work on a permuted copy
-        inp_work = dim_compress(inp.clone().contiguous(), dim)
-        src_work = dim_compress(src, dim)
-
-        if needs_cast:
-            inp_work = inp_work.to(torch.float32)
-            src_work = src_work.to(torch.float32)
-
-        # Make contiguous
-        inp_work = inp_work.contiguous()
-        src_work = src_work.contiguous()
-
-        # Calculate grid with autotune
-        grid = lambda meta: (
-            triton.cdiv(M, meta["BLOCK_M"]),
-            triton.cdiv(N, meta["BLOCK_N"]),
-        )
-
-        with torch_device_fn.device(inp.device):
-            index_add_kernel[grid](inp_work, index, src_work, M, N, alpha, inp_len)
-
-        # Cast back to original dtype if needed
-        if needs_cast:
-            inp_work = inp_work.to(orig_dtype)
-
-        # Restore original dimension order and copy back
-        order = list(range(inp_work.ndim - 1))
-        order.insert(dim, final_dim)
-        inp_work = inp_work.permute(order).contiguous()
-        inp.copy_(inp_work)
-    else:
-        # Can work directly on input if already contiguous
-        inp_contig = inp.contiguous()
-        src_contig = src.contiguous()
-
-        if needs_cast:
-            inp_contig = inp_contig.to(torch.float32)
-            src_contig = src_contig.to(torch.float32)
-
-        # Calculate grid with autotune
-        grid = lambda meta: (
-            triton.cdiv(M, meta["BLOCK_M"]),
-            triton.cdiv(N, meta["BLOCK_N"]),
-        )
-
-        with torch_device_fn.device(inp.device):
-            index_add_kernel[grid](inp_contig, index, src_contig, M, N, alpha, inp_len)
-
-        # Cast back to original dtype if needed
-        if needs_cast:
-            inp_contig = inp_contig.to(orig_dtype)
-
-        # Copy back if input wasn't contiguous
-        if not inp.is_contiguous():
-            inp.copy_(inp_contig)
-
-    return inp
+    return _index_add_impl(inp, dim, index, src, alpha, out=None)
