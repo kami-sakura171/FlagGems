@@ -13,13 +13,23 @@
 # limitations under the License.
 
 from .cross_entropy_loss import cross_entropy_loss
-from .matmul_bias_activation import matmul_bias_activation
-from .matmuladd import matmuladd
 from .sparse_attention import sparse_attn_triton
+
+# matmuladd / matmul_bias_activation 依赖 triton.tools.tensor_descriptor
+# （triton 3.3+），musa triton 3.2 无此模块；缺依赖时只跳过这两个，
+# 避免拖垮整个 fused 包的导入
+try:
+    from .matmul_bias_activation import matmul_bias_activation
+    from .matmuladd import matmuladd
+
+    _HAS_FUSED_MATMUL = True
+except ModuleNotFoundError:
+    _HAS_FUSED_MATMUL = False
 
 __all__ = [
     "cross_entropy_loss",
-    "matmul_bias_activation",
     "sparse_attn_triton",
-    "matmuladd",
 ]
+
+if _HAS_FUSED_MATMUL:
+    __all__.extend(["matmul_bias_activation", "matmuladd"])

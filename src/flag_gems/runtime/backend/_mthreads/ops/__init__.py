@@ -232,24 +232,22 @@ if _HAS_W8A8:
 
 
 if get_device_capability(current_device())[0] >= 3:
-    from .addmm import addmm, addmm_dtype, addmm_dtype_out, addmm_out  # noqa: F401
+    # addmm/bmm/mm 依赖 triton.tools.tensor_descriptor 与 tl.load_tensor_descriptor
+    # （triton 3.3+），musa triton 3.2 不支持；缺依赖时只跳过这三个，
+    # 不影响同块的 baddbmm/gelu/tanh
+    try:
+        from .addmm import addmm, addmm_dtype, addmm_dtype_out, addmm_out  # noqa: F401
+        from .bmm import bmm  # noqa: F401
+        from .mm import mm  # noqa: F401
+
+        __all__.extend(
+            ["addmm", "addmm_dtype", "addmm_dtype_out", "addmm_out", "bmm", "mm"]
+        )
+    except ModuleNotFoundError:
+        pass
+
     from .baddbmm import baddbmm, baddbmm_out  # noqa: F401
-    from .bmm import bmm  # noqa: F401
     from .gelu import gelu  # noqa: F401
-    from .mm import mm  # noqa: F401
     from .tanh import tanh  # noqa: F401
 
-    __all__.extend(
-        [
-            "addmm",
-            "addmm_dtype",
-            "addmm_dtype_out",
-            "addmm_out",
-            "baddbmm",
-            "baddbmm_out",
-            "bmm",
-            "gelu",
-            "mm",
-            "tanh",
-        ]
-    )
+    __all__.extend(["baddbmm", "baddbmm_out", "gelu", "tanh"])
