@@ -99,7 +99,15 @@ from .tile import tile
 from .trunc import trunc, trunc_
 from .unique import _unique2
 from .upsample_linear1d_backward import upsample_linear1d_backward
-from .w8a8_block_fp8_matmul import w8a8_block_fp8_matmul
+# w8a8_block_fp8_matmul 依赖 triton.tools.tensor_descriptor（triton 3.3+ 才有），
+# musa triton 3.2 无此模块。缺依赖时只跳过该算子，
+# 避免单个模块导入失败导致整个 _mthreads.ops 回退到通用实现。
+try:
+    from .w8a8_block_fp8_matmul import w8a8_block_fp8_matmul
+
+    _HAS_W8A8 = True
+except ModuleNotFoundError:
+    _HAS_W8A8 = False
 from .zeros import zero_, zeros
 from .zeros_like import zeros_like
 
@@ -214,11 +222,13 @@ __all__ = [
     "trunc",
     "trunc_",
     "upsample_linear1d_backward",
-    "w8a8_block_fp8_matmul",
     "zero_",
     "zeros",
     "zeros_like",
 ]
+
+if _HAS_W8A8:
+    __all__.append("w8a8_block_fp8_matmul")
 
 
 if get_device_capability(current_device())[0] >= 3:
