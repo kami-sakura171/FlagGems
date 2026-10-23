@@ -39,30 +39,12 @@ _DECOUPLED_MIN_K = 256
 _DECOUPLED_MIN_N = 256
 _DECOUPLED_PATHOLOGIC_TILE_N = 16
 
-# ---------------------------------------------------------------------------
-# v11: single-pass inner backward for medium N (1024 < N < 16384)
-#
-# The upstream `softmax_backward_kernel_inner` autotunes `TILE_N` over
-# {32,64,128,256,1024}, so its heuristic `ONE_TILE_PER_CTA = (TILE_N >= N)`
-# is NEVER satisfied for N > 1024.  That forces the two-pass `else` branch,
-# which traverses the `out` and `out_grad` arrays TWICE (once to reduce, once
-# to apply) => 5 array traversals instead of the 3 an ideal single-pass needs.
-#
-# The v11 kernel keeps the whole row resident in registers, so it does
-# 1 read of `out` + 1 read of `out_grad` + 1 write of `in_grad` = 3 traversals.
-#
-# It also uses a 1-D tile instead of the upstream 2-D [1, N] tile.  The 2-D
-# shape lowers to `sizePerThread=[1,1]` => scalar 2-byte loads, while the 1-D
-# tile lowers to `sizePerThread=[N/(32*num_warps)]` => vectorized loads.
-# ---------------------------------------------------------------------------
 _V11_DISABLED = os.environ.get("GEMS_SOFTMAX_BWD_V11", "0") == "1"
 
-# Rows longer than this are handled by the two-pass large-N kernel, which
-# streams the row in tiles instead of holding it in registers.
+
 _V11_MAX_N = 8192
 
-# Minimum N for the fused path.  For N <= 1024 the upstream inner kernel
-# already hits ONE_TILE_PER_CTA=True and is single-pass, so leave it alone.
+
 _V11_MIN_N = 1024
 
 _V9_DISABLED = os.environ.get("GEMS_SOFTMAX_BWD_V8", "0") == "1"
@@ -344,18 +326,6 @@ def _packed_small_n_tiles(N):
         return 32, tile_n
     return max(1, 1024 // tile_n), tile_n
 
-
-# ---------------------------------------------------------------------------
-# v11 single-pass inner backward kernel.
-#
-# One CTA owns one row of length N and keeps the whole row in registers:
-#   load out (1x) + load out_grad (1x) -> reduce -> store in_grad (1x)
-# = 3 array traversals, versus the 5 traversals of the upstream two-pass
-# `else` branch, which re-reads both input arrays after the reduction.
-#
-# The row is held as a 1-D [TILE_N] fp32 vector, so TILE_N is capped at
-# 8192 to keep the register footprint bounded (8192 fp32 = 32 KiB per CTA).
-# ---------------------------------------------------------------------------
 @libentry()
 @triton.jit
 def softmax_backward_inner_fused_kernel(
@@ -389,24 +359,11 @@ def softmax_backward_inner_fused_kernel(
 
 
 def _inner_fused_launch(tile_n):
-    """Pick num_warps so that each thread owns ~16 elements of the row.
-
-    That keeps `sizePerThread` high enough for the 1-D tile to lower into
-    vectorized (rather than scalar) loads, while staying inside the
-    131072-register-per-block budget of the MTT S5000.
-    """
     num_warps = 8 if tile_n <= 4096 else 16
     return num_warps, 2
 
 
 def _use_inner_fused_path(N):
-    """Route medium-N inner rows through the single-pass fused kernel.
-
-    For N <= 1024 the upstream inner kernel already satisfies
-    ONE_TILE_PER_CTA and is single-pass, so it must be left alone.
-    For N >= 16384 the row no longer fits in registers and the streaming
-    large-N kernel is the better choice.
-    """
     if _V11_DISABLED:
         return False
     if N <= _V11_MIN_N:

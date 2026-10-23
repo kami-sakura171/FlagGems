@@ -44,24 +44,9 @@ def max_pool2d_output_size(
 
     return output_size
 
-
-# ==============================================================================
-# Kernel 1: 通道打包 Kernel (v12 — 方向 A 拓 num_stages=3/4, num_warps=2)
-#
-# 改动逻辑 (相对于 v11):
-#   方向 A: 在 autotune configs 里追加 num_stages=3, 4 与 num_warps=2 候选.
-#           触发条件: MTT S5000 = 60 SM × 128 phys regs/SM, num_stages=4 在
-#           BLOCK_C=2 上 register footprint ~16K (每 SM 上限 131K), 远未溢出.
-#           此前 v6/v9/v10/v11 全部停在 num_stages=2, 是被 64 SM × 256 reg
-#           的 NV A100 直觉带偏了.
-#
-#   保留 v11 的方向 A mask 物化技巧: load(..., mask=c_mask & valid_spatial,
-#   other=-inf, fp32 cast 一次完成).
-# ==============================================================================
 @libentry()
 @triton.autotune(
     configs=[
-        # v11 默认 baseline (保留以做对照)
         triton.Config({"BLOCK_C": 2}, num_stages=2, num_warps=2),
         triton.Config({"BLOCK_C": 4}, num_stages=2, num_warps=2),
         triton.Config({"BLOCK_C": 4}, num_stages=2, num_warps=4),
@@ -70,15 +55,10 @@ def max_pool2d_output_size(
         triton.Config({"BLOCK_C": 16}, num_stages=2, num_warps=4),
         triton.Config({"BLOCK_C": 16}, num_stages=2, num_warps=8),
         triton.Config({"BLOCK_C": 32}, num_stages=2, num_warps=8),
-        # 🆕 v12 — 方向 A: num_stages=3 pipeline 隐藏 memory latency
         triton.Config({"BLOCK_C": 2}, num_stages=3, num_warps=2),
         triton.Config({"BLOCK_C": 4}, num_stages=3, num_warps=2),
         triton.Config({"BLOCK_C": 4}, num_stages=3, num_warps=4),
         triton.Config({"BLOCK_C": 8}, num_stages=3, num_warps=4),
-        # 🆕 v12 — 方向 A: num_stages=4 双 buffer pipeline
-        # MTT S5000 单 SM 物理 128 regs, 但单 Block 允许 131K regs.
-        # BLOCK_C=4 + BLOCK_HW=16 + num_stages=4 ≈ 64 regs/thread × 32 thread × 4 = 8K,
-        # 远低于上限. 关键目标 case: (4,3,224) 的庞大 grids.
         triton.Config({"BLOCK_C": 2}, num_stages=4, num_warps=2),
         triton.Config({"BLOCK_C": 4}, num_stages=4, num_warps=2),
         triton.Config({"BLOCK_C": 4}, num_stages=4, num_warps=4),
@@ -147,10 +127,7 @@ def max_pool2d_channel_packed_kernel(
             h_in_safe = tl.maximum(0, tl.minimum(h_in, in_h - 1))
             w_in_safe = tl.maximum(0, tl.minimum(w_in, in_w - 1))
             spatial_offset_safe = h_in_safe * in_w + w_in_safe
-
             input_offset = c_base_offset + spatial_offset_safe[None, :]
-
-            # ✅ v11 方向 A 保留: (c_mask AND valid_spatial) → mask
             load_mask_2d = c_mask[:, None] & valid_spatial[None, :]
             raw_val = tl.load(
                 input_ptr + input_offset, mask=load_mask_2d, other=min_in_f32
@@ -172,15 +149,9 @@ def max_pool2d_channel_packed_kernel(
     tl.store(
         indices_ptr + out_base_offset, max_idx_acc.to(tl.int64), mask=store_mask
     )
-
-
-# ==============================================================================
-# Kernel 2: 2D Forward Kernel (常规, dilation==1 case)
-# ==============================================================================
 @libentry()
 @triton.autotune(
     configs=[
-        # ===== v11 baseline (保留) =====
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=2, num_warps=4),
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=3, num_warps=4),
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=2, num_warps=4),
@@ -192,8 +163,6 @@ def max_pool2d_channel_packed_kernel(
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 64}, num_stages=2, num_warps=4),
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 64}, num_stages=2, num_warps=8),
         triton.Config({"BLOCK_H": 64, "BLOCK_W": 32}, num_stages=2, num_warps=8),
-        # 🆕 v12 — 方向 A (num_stages=3/4, 拓 pipeline 深度)
-        # warp=2 减小 register pressure 让更大 num_stages 不溢出
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=3, num_warps=2),
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=3, num_warps=2),
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=3, num_warps=2),
@@ -202,7 +171,6 @@ def max_pool2d_channel_packed_kernel(
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=4, num_warps=4),
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 32}, num_stages=3, num_warps=8),
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 32}, num_stages=4, num_warps=8),
-        # 🆕 v12 — 方向 B (BLOCK=512 各种 BLOCK_H × BLOCK_W)
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=3, num_warps=4),
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=3, num_warps=4),
     ],
@@ -295,43 +263,20 @@ def max_pool2d_forward_kernel(
     tl.store(output_block_ptr, max_val_acc.to(dtype), mask=out_mask)
     tl.store(indices_block_ptr, max_idx_acc.to(tl.int64), mask=out_mask)
 
-
-# ==============================================================================
-# Kernel 3 (🆕 v12 — 方向 D): dilation-aware Forward Kernel
-#
-# 动机: (dilation_h > 1 or dilation_w > 1) case 在 v11 是最痛点:
-#   - (4,3,224) d=2: fp16=0.750x, fp32=0.750x
-#   - (16,64,56) d=2: fp16=0.729x, fp32=0.742x
-#   - (32,128,28) d=2: fp16=0.619x, fp32=0.627x
-#   - (64,256,14) d=2: fp16=0.421x, fp32=0.440x  ← worst case
-#
-# dilation=2 让相邻 kh/kw iteration 的 h_in/w_in 跳跃 stride*2,
-# 实际触达的输入点是 3x3=9 个但分布在更大的输入区域上, 访存 pattern 不连续.
-#
-# 关键 insight: dilation kernel 的 h_in_safe/w_in_safe clamp 是**确定性**的,
-# 与 dilation=1 路径完全独立, 但 v11 走的是同一 kernel.
-# 我们把它分出来, autotune key 不含 dilation_h/w (dilation 永远 > 1),
-# 允许更激进的 BLOCK 选择 (BLOCK 翻倍可以抵消 dilation 带来的访存距离).
-# ==============================================================================
 @libentry()
 @triton.autotune(
     configs=[
-        # dilation=2 case 偏好: 大 BLOCK (因为每个输出点触达的 input 距离大,
-        # L1 命中率低, 必须靠大规模数据并行抵消; 同时 register footprint 允许更大 BLOCK)
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=2, num_warps=4),
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=2, num_warps=4),
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=2, num_warps=4),
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 32}, num_stages=2, num_warps=8),
-        # num_stages=3/4 pipeline (方向 A 移植)
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=3, num_warps=4),
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=3, num_warps=4),
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=3, num_warps=4),
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=4, num_warps=4),
-        # warp=2 让更大 num_stages 不溢出, 关键: dilation 路径 register pressure 高
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=3, num_warps=2),
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=3, num_warps=2),
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=4, num_warps=2),
-        # (方向 B) BLOCK=512 探索
         triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=2, num_warps=2),
         triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=2, num_warps=2),
         triton.Config({"BLOCK_H": 64, "BLOCK_W": 8}, num_stages=2, num_warps=4),
@@ -344,7 +289,6 @@ def max_pool2d_forward_kernel(
         "kernel_w",
         "stride_h",
         "stride_w",
-        # dilation 不进 key: 这个 kernel 永远走 dilation>0 路径
     ],
 )
 @triton.jit
@@ -372,8 +316,6 @@ def max_pool2d_forward_kernel_dilated(
     BLOCK_H: tl.constexpr,
     BLOCK_W: tl.constexpr,
 ):
-    """专用 dilation>1 kernel, 与 max_pool2d_forward_kernel 共享结构
-    但不复用 dilation=1 的 autotune cache."""
     pid_nc = tl.program_id(0)
     pid_hw = tl.program_id(1)
     num_w_blocks = tl.cdiv(out_w, BLOCK_W)
@@ -391,11 +333,6 @@ def max_pool2d_forward_kernel_dilated(
     max_idx_acc = tl.full((BLOCK_H, BLOCK_W), -1, dtype=tl.int32)
 
     input_base_ptr = input_ptr + n_idx * in_stride_n + c_idx * in_stride_c
-
-    # 🚨 dilation>1 关键差异: in_mask 必须按 (h_in, w_in) 的 dilation 步进
-    # 判断边界, dilation > 1 时 padding 占比极大 (尤其当 (in_h, in_w) 不大时).
-    # 必须保留 tl.where 后处理 (v11 方向 A 的 mask 物化在 dilation>1 会引入
-    # 错误的 safe_offset; 在 dilated kernel 里改回 v9 风格更稳).
     for kh in tl.static_range(0, kernel_h):
         for kw in tl.static_range(0, kernel_w):
             h_in = h_out_offsets[:, None] * stride_h - padding_h + kh * dilation_h
@@ -404,9 +341,6 @@ def max_pool2d_forward_kernel_dilated(
             h_in_safe = tl.maximum(0, tl.minimum(h_in, in_h - 1))
             w_in_safe = tl.maximum(0, tl.minimum(w_in, in_w - 1))
             safe_offset = h_in_safe * in_stride_h + w_in_safe * in_stride_w
-
-            # dilation 路径强制走 v9 风格: 全 in-bounds load + where 滤 padding
-            # (mask 物化在 dilation 上会编译出错误的 predicated path)
             raw_val = tl.load(input_base_ptr + safe_offset)
             in_mask = (h_in >= 0) & (h_in < in_h) & (w_in >= 0) & (w_in < in_w)
             raw_val_f32 = raw_val.to(tl.float32)
@@ -431,9 +365,6 @@ def max_pool2d_forward_kernel_dilated(
     tl.store(indices_block_ptr, max_idx_acc.to(tl.int64), mask=out_mask)
 
 
-# ==============================================================================
-# 反向 Kernel (与 v9 一致, 不动)
-# ==============================================================================
 @libentry()
 @triton.autotune(
     configs=[
@@ -568,10 +499,6 @@ def _parse_pool_params(kernel_size, stride, padding, dilation):
         dilation_w,
     )
 
-
-# ==============================================================================
-# Main dispatcher (方向 D integration)
-# ==============================================================================
 def max_pool2d_with_indices(
     input: torch.Tensor,
     kernel_size,
@@ -618,16 +545,9 @@ def max_pool2d_with_indices(
     ), "Feature map elements exceed int32 representable range."
 
     out_hw = out_h * out_w
-
-    # ===== 三路分发 (v12) =====
-    # 路径 1: 小输出空间 + dilation 任意 → 通道打包 kernel
-    # 路径 2: 大输出空间 + dilation == 1 → 常规 2D forward kernel
-    # 路径 3 (🆕): 大输出空间 + dilation > 1 → 专用 dilated kernel
     spatial_threshold = 64 if (dilation_h > 1 or dilation_w > 1) else 196
     has_dilation = dilation_h > 1 or dilation_w > 1
-
     if out_hw <= spatial_threshold:
-        # 路径 1: 通道打包 (out_hw ≤ 阈值), dilation 任意
         total_channels = in_n * in_c
 
         BLOCK_HW = max(16, triton.next_power_of_2(out_hw))
@@ -654,7 +574,6 @@ def max_pool2d_with_indices(
             BLOCK_HW=BLOCK_HW,
         )
     elif has_dilation:
-        # 路径 3 (🆕 方向 D): 大输出 + dilation>1 → 专用 dilated kernel
         grid = lambda meta: (
             in_n * in_c,
             triton.cdiv(out_h, meta["BLOCK_H"]) * triton.cdiv(out_w, meta["BLOCK_W"]),
@@ -682,12 +601,10 @@ def max_pool2d_with_indices(
             dilation_w,
         )
     else:
-        # 路径 2: 大输出 + dilation==1 → 常规 forward kernel
         grid = lambda meta: (
             in_n * in_c,
             triton.cdiv(out_h, meta["BLOCK_H"]) * triton.cdiv(out_w, meta["BLOCK_W"]),
         )
-
         max_pool2d_forward_kernel[grid](
             input,
             output,
@@ -712,7 +629,6 @@ def max_pool2d_with_indices(
         )
 
     return output, indices
-
 
 def max_pool2d_backward(
     grad_output: torch.Tensor,
@@ -779,7 +695,6 @@ def max_pool2d_backward(
     )
 
     return grad_input.to(grad_output.dtype)
-
 
 def max_pool2d_with_indices_backward(
     grad_output: torch.Tensor,
