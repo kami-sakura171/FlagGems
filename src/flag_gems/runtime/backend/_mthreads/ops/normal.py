@@ -104,7 +104,6 @@ def normal_(self, mean=0, std=1, *, generator=None):
     transform_func_float_float(self, std, mean, out0=self)
     return self
 
-
 _DTYPE_MAP = {
     torch.float32: tl.float32,
     torch.float16: tl.float16,
@@ -170,7 +169,6 @@ def _normal_tensor_float_fused_kernel(
 
     n0, n1 = _pair_uniform_to_normal_fast(r0, r1)
     n2, n3 = _pair_uniform_to_normal_fast(r2, r3)
-
     r0f = n0 * std_val + m0.to(tl.float32)
     r1f = n1 * std_val + m1.to(tl.float32)
     r2f = n2 * std_val + m2.to(tl.float32)
@@ -196,7 +194,6 @@ def normal_tensor_float(mean, std, *, generator=None):
         if not mean.is_contiguous():
             mean = mean.contiguous()
         is_bcast = False
-
     if N <= 16384:
         cur_block = 256
     else:
