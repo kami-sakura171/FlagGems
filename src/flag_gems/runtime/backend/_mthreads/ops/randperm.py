@@ -30,7 +30,6 @@ V3_RADIX_BITS = 4
 V3_RADIX_BINS = 16
 
 _MAX_INT16_VAL = tl.constexpr(torch.iinfo(torch.int16).max)
-_MAX_KEY_VAL = tl.constexpr(0x7FFFFFFE)
 _PAD_KEY_VAL = tl.constexpr(0x7FFFFFFF)
 _MAX_INT64_VAL = tl.constexpr(torch.iinfo(torch.int64).max)
 
@@ -68,100 +67,6 @@ def ultra_slim_bitonic_kernel(
 
 @libentry()
 @triton.jit(do_not_specialize=["n_elements", "philox_seed", "philox_offset"])
-def block_sort_kernel(
-    key_out_ptr,
-    val_out_ptr,
-    n_elements,
-    philox_seed,
-    philox_offset,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    cols = tl.arange(0, BLOCK)
-    global_offs = pid.to(tl.int64) * BLOCK + cols
-    mask = (global_offs < n_elements.to(tl.int64)).to(tl.int1)
-
-    raw = _philox_u32(philox_seed, philox_offset, global_offs)
-    key = (raw & 0x7FFFFFFE).to(tl.int32)
-    key = tl.where(mask, key, _PAD_KEY_VAL)
-
-    vals = global_offs.to(tl.int32)
-    sorted_keys, sorted_vals = argsort(key, vals, 0, descending=False)
-
-    tl.store(key_out_ptr + pid * BLOCK + cols, sorted_keys)
-    tl.store(val_out_ptr + pid * BLOCK + cols, sorted_vals)
-
-
-@libentry()
-@triton.jit(do_not_specialize=["n_elements"])
-def merge_by_rank_kernel(
-    key_buf_ptr,
-    val_buf_ptr,
-    out_ptr,
-    n_elements,
-    NUM_TILES: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    cols = tl.arange(0, BLOCK)
-    my_offs = pid.to(tl.int64) * BLOCK + cols
-    my_mask = (my_offs < n_elements.to(tl.int64)).to(tl.int1)
-
-    my_key = tl.load(key_buf_ptr + my_offs, mask=my_mask, other=_PAD_KEY_VAL)
-    my_val = tl.load(val_buf_ptr + my_offs, mask=my_mask, other=0)
-
-    rank = cols.to(tl.int64)
-
-    for k in range(NUM_TILES):
-        if k != pid:
-            chunk_start = k * BLOCK
-            chunk_len = n_elements - chunk_start
-            chunk_len = tl.minimum(BLOCK, chunk_len)
-
-            cmp_key = my_key + tl.where(pid > k, 1, 0)
-
-            low = tl.zeros([BLOCK], dtype=tl.int32)
-            high = tl.full([BLOCK], BLOCK, dtype=tl.int32)
-            high = tl.minimum(high, chunk_len)
-
-            for _ in range(10):
-                mid = (low + high) // 2
-                k_val = tl.load(
-                    key_buf_ptr + chunk_start + mid,
-                    mask=(mid < chunk_len),
-                    other=_PAD_KEY_VAL,
-                )
-                cond = k_val < cmp_key
-                low = tl.where(cond, mid + 1, low)
-                high = tl.where(cond, high, mid)
-
-            rank += low.to(tl.int64)
-
-    tl.store(out_ptr + rank, my_val.to(out_ptr.dtype.element_ty), mask=my_mask)
-
-
-def _launch_block_merge_sort(out, n, generator):
-    block = 1024
-    tiles = triton.cdiv(n, block)
-    device = out.device
-
-    buf = torch.empty(tiles * block * 2, dtype=torch.int32, device=device)
-    key_buf = buf[:tiles * block]
-    val_buf = buf[tiles * block:]
-
-    seed, offset = philox_backend_seed_offset(n, generator=generator)
-
-    with torch_device_fn.device(device):
-        block_sort_kernel[(tiles,)](
-            key_buf, val_buf, n, seed, offset, block, num_warps=8
-        )
-        merge_by_rank_kernel[(tiles,)](
-            key_buf, val_buf, out, n, NUM_TILES=tiles, BLOCK=block, num_warps=8
-        )
-
-
-@libentry()
-@triton.jit(do_not_specialize=["n_elements", "philox_seed", "philox_offset"])
 def bucket_scatter_kernel(
     bucket_keys_ptr,
     bucket_vals_ptr,
@@ -183,8 +88,8 @@ def bucket_scatter_kernel(
     slot = tl.atomic_add(bucket_counts_ptr + bucket_id, 1, mask=mask)
 
     dest = bucket_id * 1024 + slot
-    tl.store(bucket_keys_ptr + dest, key, mask=mask)
-    tl.store(bucket_vals_ptr + dest, idx.to(tl.int32), mask=mask)
+    tl.store(bucket_keys_ptr + dest, key, mask=mask, cache_modifier=".cg")
+    tl.store(bucket_vals_ptr + dest, idx.to(tl.int32), mask=mask, cache_modifier=".cg")
 
 
 @libentry()
@@ -220,10 +125,12 @@ def _launch_uniform_bucket_sort(out, n, generator):
     num_buckets = 16
     bucket_cap = 1024
 
-    buf = torch.empty(num_buckets * bucket_cap * 2, dtype=torch.int32, device=device)
-    bucket_keys = buf[:num_buckets * bucket_cap]
-    bucket_vals = buf[num_buckets * bucket_cap:]
-    bucket_counts = torch.zeros(num_buckets, dtype=torch.int32, device=device)
+    total_buf_size = num_buckets * bucket_cap * 2 + num_buckets
+    buf = torch.empty(total_buf_size, dtype=torch.int32, device=device)
+    bucket_keys = buf[: num_buckets * bucket_cap]
+    bucket_vals = buf[num_buckets * bucket_cap : num_buckets * bucket_cap * 2]
+    bucket_counts = buf[num_buckets * bucket_cap * 2 :]
+    bucket_counts.zero_()
 
     seed, offset = philox_backend_seed_offset(n, generator=generator)
     scatter_grid = (triton.cdiv(n, bucket_cap),)
@@ -235,7 +142,6 @@ def _launch_uniform_bucket_sort(out, n, generator):
         bucket_sort_compact_kernel[(num_buckets,)](
             bucket_keys, bucket_vals, bucket_counts, out, bucket_cap, num_warps=8
         )
-
 
 @libentry()
 @triton.jit(do_not_specialize=["n_elements", "bit_offset"])
@@ -309,8 +215,8 @@ def radix_scatter_kernel(
         m = (digit == b) & mask
         rank = tl.cumsum(m.to(tl.int32)) - 1
         dest = tl.load(base + b) + rank.to(tl.int64)
-        tl.store(key_out_ptr + dest, key, mask=m)
-        tl.store(val_out_ptr + dest, val.to(val_out_ptr.dtype.element_ty), mask=m)
+        tl.store(key_out_ptr + dest, key, mask=m, cache_modifier=".cg")
+        tl.store(val_out_ptr + dest, val.to(val_out_ptr.dtype.element_ty), mask=m, cache_modifier=".cg")
 
 
 def _launch_fast_radix_mid(out, n, generator):
@@ -469,7 +375,7 @@ def _launch_fast_radix_large(out, n, generator):
             scan_reduce_16_kernel[(num_chunks, num_bins)](tile_hist, chunk_sums, tiles, CHUNK_SIZE=chunk_size, num_warps=4)
             scan_spine_16_kernel[(1,)](chunk_sums, chunk_bases, num_chunks, MAX_CHUNKS=128, num_warps=4)
             scan_apply_16_kernel[(num_chunks, num_bins)](tile_hist, chunk_bases, global_off, tiles, CHUNK_SIZE=chunk_size, num_warps=4)
-            
+
             has_val = 1 if p > 0 else 0
             if p == 0:
                 val_in = val_a
@@ -486,7 +392,6 @@ def _launch_fast_radix_large(out, n, generator):
                 n, bit_offset, has_val, num_bins, block, num_warps=8
             )
             k_in, k_out = k_out, k_in
-
 
 def randperm(
     n,
@@ -511,18 +416,14 @@ def randperm(
     if out is None:
         out = torch.empty(n, dtype=dtype, device=device)
 
-    if n <= 1024:
+    if n <= 512:
         block_size = triton.next_power_of_2(n)
         seed, offset = philox_backend_seed_offset(n, generator=generator)
-        num_warps = 8 if block_size >= 1024 else 4
+        num_warps = 4
         with torch_device_fn.device(device):
             ultra_slim_bitonic_kernel[(1,)](
                 out, n, seed, offset, BLOCK_SIZE=block_size, num_warps=num_warps,
             )
-        return out
-
-    if n <= 4096:
-        _launch_block_merge_sort(out, n, generator)
         return out
 
     if n <= 10000:
