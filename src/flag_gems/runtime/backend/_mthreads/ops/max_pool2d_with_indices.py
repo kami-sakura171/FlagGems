@@ -36,33 +36,43 @@ def max_pool2d_output_size(
     numerator = in_size + 2 * padding - effective_kernel_size
     if ceil_mode:
         output_size = (numerator + stride - 1) // stride + 1
-        # PyTorch-compatible adjustment for ceil_mode
         if (output_size - 1) * stride >= in_size + padding:
             output_size -= 1
     else:
         output_size = numerator // stride + 1
-
     return output_size
 
+
+# Channel-packed forward kernel: each program computes a (BLOCK_C, BLOCK_HW)
+# tile of outputs, packing multiple channels into one program.
+# The grid is 2-D (channel blocks x hw blocks) so that mid-size spatial
+# outputs (out_hw ~ 100-2000) still launch enough programs to fill the GPU.
 @libentry()
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_C": 2}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_C": 4}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_C": 4}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_C": 8}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_C": 8}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_C": 16}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_C": 16}, num_stages=2, num_warps=8),
-        triton.Config({"BLOCK_C": 32}, num_stages=2, num_warps=8),
-        triton.Config({"BLOCK_C": 2}, num_stages=3, num_warps=2),
-        triton.Config({"BLOCK_C": 4}, num_stages=3, num_warps=2),
-        triton.Config({"BLOCK_C": 4}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_C": 8}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_C": 2}, num_stages=4, num_warps=2),
-        triton.Config({"BLOCK_C": 4}, num_stages=4, num_warps=2),
-        triton.Config({"BLOCK_C": 4}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_C": 8}, num_stages=4, num_warps=4),
+        # Small tiles: best for tiny spatial outputs (out_hw <= ~100) where
+        # many small programs beat few fat ones (verified on MTT S5000).
+        triton.Config({"BLOCK_C": 2, "BLOCK_HW": 16}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_C": 4, "BLOCK_HW": 16}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_C": 8, "BLOCK_HW": 16}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_C": 16, "BLOCK_HW": 16}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_C": 4, "BLOCK_HW": 32}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_C": 8, "BLOCK_HW": 32}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_C": 16, "BLOCK_HW": 32}, num_stages=2, num_warps=4),
+        # Mid/large tiles: best for mid-size spatial outputs (out_hw ~ 200-800)
+        # where a 1-D grid cannot fill the GPU without splitting HW.
+        triton.Config({"BLOCK_C": 2, "BLOCK_HW": 64}, num_stages=2, num_warps=2),
+        triton.Config({"BLOCK_C": 4, "BLOCK_HW": 64}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_C": 2, "BLOCK_HW": 128}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_C": 8, "BLOCK_HW": 64}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_C": 16, "BLOCK_HW": 64}, num_stages=3, num_warps=4),
+        triton.Config({"BLOCK_C": 32, "BLOCK_HW": 64}, num_stages=2, num_warps=8),
+        triton.Config({"BLOCK_C": 4, "BLOCK_HW": 128}, num_stages=2, num_warps=4),
+        triton.Config({"BLOCK_C": 8, "BLOCK_HW": 128}, num_stages=2, num_warps=4),
+        # Tile area is capped at 16 x 128 lanes: larger tiles (e.g.
+        # BLOCK_C=32 x BLOCK_HW=256) spill badly in fp32 and were observed to
+        # trip an illegal-memory-access in the codegen on MTT S5000.
+        triton.Config({"BLOCK_C": 16, "BLOCK_HW": 128}, num_stages=2, num_warps=8),
     ],
     key=[
         "total_channels",
@@ -83,7 +93,6 @@ def max_pool2d_channel_packed_kernel(
     total_channels,
     in_h,
     in_w,
-    out_h,
     out_w,
     out_hw,
     kernel_h: tl.constexpr,
@@ -94,12 +103,13 @@ def max_pool2d_channel_packed_kernel(
     padding_w: tl.constexpr,
     dilation_h: tl.constexpr,
     dilation_w: tl.constexpr,
-    BLOCK_HW: tl.constexpr,
     BLOCK_C: tl.constexpr,
+    BLOCK_HW: tl.constexpr,
 ):
     pid_c = tl.program_id(0)
+    pid_hw = tl.program_id(1)
     c_offsets = pid_c * BLOCK_C + tl.arange(0, BLOCK_C)
-    hw_offsets = tl.arange(0, BLOCK_HW)
+    hw_offsets = pid_hw * BLOCK_HW + tl.arange(0, BLOCK_HW)
 
     c_mask = c_offsets < total_channels
     hw_mask = hw_offsets < out_hw
@@ -108,36 +118,57 @@ def max_pool2d_channel_packed_kernel(
     w_out = hw_offsets % out_w
 
     dtype = input_ptr.type.element_ty
-    min_in_f32 = float("-inf")
-    max_val_acc = tl.full((BLOCK_C, BLOCK_HW), min_in_f32, dtype=tl.float32)
-    max_idx_acc = tl.full((BLOCK_C, BLOCK_HW), -1, dtype=tl.int32)
+    min_val = get_dtype_min(dtype)
+    max_val_acc = tl.full((BLOCK_C, BLOCK_HW), min_val, dtype=tl.float32)
+    # Only the winning window position (a small constexpr constant per step)
+    # is tracked inside the loop; the flat input index is reconstructed once
+    # after the loop. This removes one multiply + add + int32 cast per window
+    # step per lane.
+    best_k = tl.full((BLOCK_C, BLOCK_HW), -1, dtype=tl.int32)
 
     in_hw_size = in_h * in_w
-    c_base_offset = c_offsets[:, None] * in_hw_size
+    # Clamp channels into range so loads stay fully unmasked (better
+    # vectorization); lanes from clamped channels are garbage but never
+    # stored (store is masked with c_mask).
+    c_safe = tl.minimum(c_offsets, total_channels - 1)
+    c_base_offset = c_safe[:, None] * in_hw_size
+
+    # Loop-invariant parts of the window coordinates.
+    h_base = h_out * stride_h - padding_h
+    w_base = w_out * stride_w - padding_w
 
     for kh in tl.static_range(0, kernel_h):
         for kw in tl.static_range(0, kernel_w):
-            h_in = h_out * stride_h - padding_h + kh * dilation_h
-            w_in = w_out * stride_w - padding_w + kw * dilation_w
-
-            valid_spatial = (
-                hw_mask & (h_in >= 0) & (h_in < in_h) & (w_in >= 0) & (w_in < in_w)
-            )
+            h_in = h_base + kh * dilation_h
+            w_in = w_base + kw * dilation_w
 
             h_in_safe = tl.maximum(0, tl.minimum(h_in, in_h - 1))
             w_in_safe = tl.maximum(0, tl.minimum(w_in, in_w - 1))
             spatial_offset_safe = h_in_safe * in_w + w_in_safe
-            input_offset = c_base_offset + spatial_offset_safe[None, :]
-            load_mask_2d = c_mask[:, None] & valid_spatial[None, :]
-            raw_val = tl.load(
-                input_ptr + input_offset, mask=load_mask_2d, other=min_in_f32
-            )
-            current_val_f32 = raw_val.to(tl.float32)
-            current_idx = (h_in * in_w + w_in).to(tl.int32)
 
-            is_new_max = current_val_f32 > max_val_acc
-            max_val_acc = tl.where(is_new_max, current_val_f32, max_val_acc)
-            max_idx_acc = tl.where(is_new_max, current_idx[None, :], max_idx_acc)
+            input_offset = c_base_offset + spatial_offset_safe[None, :]
+
+            raw_val_f32 = tl.load(input_ptr + input_offset).to(tl.float32)
+
+            # Padding is folded into the comparison predicate instead of
+            # materialising an -inf value: an out-of-bounds lane simply never
+            # wins, which is equivalent and saves one select per window step.
+            valid_spatial = (h_in >= 0) & (h_in < in_h) & (w_in >= 0) & (w_in < in_w)
+
+            is_new_max = (raw_val_f32 > max_val_acc) & valid_spatial[None, :]
+            max_val_acc = tl.where(is_new_max, raw_val_f32, max_val_acc)
+            best_k = tl.where(is_new_max, kh * kernel_w + kw, best_k)
+
+    # Rebuild the flat input index from the winning window position. Lanes
+    # that never won (best_k == -1, i.e. windows fully inside the padding)
+    # keep the -1 sentinel.
+    kh_best = best_k // kernel_w
+    kw_best = best_k % kernel_w
+    best_h_in = h_base[None, :] + kh_best * dilation_h
+    best_w_in = w_base[None, :] + kw_best * dilation_w
+    max_idx_acc = tl.where(
+        best_k >= 0, (best_h_in * in_w + best_w_in).to(tl.int32), -1
+    )
 
     out_base_offset = c_offsets[:, None] * out_hw + hw_offsets[None, :]
     store_mask = c_mask[:, None] & hw_mask[None, :]
@@ -149,30 +180,44 @@ def max_pool2d_channel_packed_kernel(
     tl.store(
         indices_ptr + out_base_offset, max_idx_acc.to(tl.int64), mask=store_mask
     )
+
+
 @libentry()
 @triton.autotune(
     configs=[
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 32}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_H": 8, "BLOCK_W": 32}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 8}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_H": 64, "BLOCK_W": 16}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 64}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 64}, num_stages=2, num_warps=8),
-        triton.Config({"BLOCK_H": 64, "BLOCK_W": 32}, num_stages=2, num_warps=8),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=3, num_warps=2),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=3, num_warps=2),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=3, num_warps=2),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=4, num_warps=2),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 32}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 32}, num_stages=4, num_warps=8),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=3, num_warps=4),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=2, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=3, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=2, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=2, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_H": 32, "BLOCK_W": 32}, num_stages=2, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_H": 8, "BLOCK_W": 32}, num_stages=2, num_warps=2
+        ),
+        triton.Config(
+            {"BLOCK_H": 32, "BLOCK_W": 8}, num_stages=2, num_warps=2
+        ),
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_W": 16}, num_stages=2, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_H": 16, "BLOCK_W": 64}, num_stages=2, num_warps=4
+        ),
+        triton.Config(
+            {"BLOCK_H": 32, "BLOCK_W": 64}, num_stages=2, num_warps=8
+        ),
+        triton.Config(
+            {"BLOCK_H": 64, "BLOCK_W": 32}, num_stages=2, num_warps=8
+        ),
     ],
     key=[
         "out_h",
@@ -222,134 +267,44 @@ def max_pool2d_forward_kernel(
     w_out_offsets = w_block_idx * BLOCK_W + tl.arange(0, BLOCK_W)
 
     dtype = input_ptr.type.element_ty
-    min_in_f32 = float("-inf")
-    max_val_acc = tl.full((BLOCK_H, BLOCK_W), min_in_f32, dtype=tl.float32)
-    max_idx_acc = tl.full((BLOCK_H, BLOCK_W), -1, dtype=tl.int32)
+    min_val = get_dtype_min(dtype)
+    max_val_acc = tl.full((BLOCK_H, BLOCK_W), min_val, dtype=tl.float32)
+    # Track the winning window position only; the flat input index is
+    # reconstructed once after the loop (saves an extra index computation
+    # per window step per lane).
+    best_k = tl.full((BLOCK_H, BLOCK_W), -1, dtype=tl.int32)
 
     input_base_ptr = input_ptr + n_idx * in_stride_n + c_idx * in_stride_c
 
+    h_base = h_out_offsets[:, None] * stride_h - padding_h
+    w_base = w_out_offsets[None, :] * stride_w - padding_w
+
     for kh in tl.static_range(0, kernel_h):
         for kw in tl.static_range(0, kernel_w):
-            h_in = h_out_offsets[:, None] * stride_h - padding_h + kh * dilation_h
-            w_in = w_out_offsets[None, :] * stride_w - padding_w + kw * dilation_w
+            h_in = h_base + kh * dilation_h
+            w_in = w_base + kw * dilation_w
 
             h_in_safe = tl.maximum(0, tl.minimum(h_in, in_h - 1))
             w_in_safe = tl.maximum(0, tl.minimum(w_in, in_w - 1))
             safe_offset = h_in_safe * in_stride_h + w_in_safe * in_stride_w
 
+            raw_val_f32 = tl.load(input_base_ptr + safe_offset).to(tl.float32)
+
+            # Padding folded into the comparison predicate: an out-of-bounds
+            # lane never wins, so no -inf value has to be materialised.
             in_mask = (h_in >= 0) & (h_in < in_h) & (w_in >= 0) & (w_in < in_w)
-            load_mask = in_mask
-            raw_val = tl.load(
-                input_base_ptr + safe_offset, mask=load_mask, other=min_in_f32
-            )
 
-            raw_val_f32 = raw_val.to(tl.float32)
-            current_idx = (h_in * in_w + w_in).to(tl.int32)
-
-            is_new_max = raw_val_f32 > max_val_acc
+            is_new_max = (raw_val_f32 > max_val_acc) & in_mask
             max_val_acc = tl.where(is_new_max, raw_val_f32, max_val_acc)
-            max_idx_acc = tl.where(is_new_max, current_idx, max_idx_acc)
+            best_k = tl.where(is_new_max, kh * kernel_w + kw, best_k)
 
-    out_base_ptr = output_ptr + pid_nc * out_h * out_w
-    indices_base_ptr = indices_ptr + pid_nc * out_h * out_w
-    output_block_ptr = (
-        out_base_ptr + h_out_offsets[:, None] * out_w + w_out_offsets[None, :]
+    kh_best = best_k // kernel_w
+    kw_best = best_k % kernel_w
+    best_h_in = h_base + kh_best * dilation_h
+    best_w_in = w_base + kw_best * dilation_w
+    max_idx_acc = tl.where(
+        best_k >= 0, (best_h_in * in_w + best_w_in).to(tl.int32), -1
     )
-    indices_block_ptr = (
-        indices_base_ptr + h_out_offsets[:, None] * out_w + w_out_offsets[None, :]
-    )
-
-    out_mask = (h_out_offsets[:, None] < out_h) & (w_out_offsets[None, :] < out_w)
-    tl.store(output_block_ptr, max_val_acc.to(dtype), mask=out_mask)
-    tl.store(indices_block_ptr, max_idx_acc.to(tl.int64), mask=out_mask)
-
-@libentry()
-@triton.autotune(
-    configs=[
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 32}, num_stages=2, num_warps=8),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=4, num_warps=4),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=3, num_warps=2),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=3, num_warps=2),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 16}, num_stages=4, num_warps=2),
-        triton.Config({"BLOCK_H": 32, "BLOCK_W": 16}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_H": 16, "BLOCK_W": 32}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_H": 64, "BLOCK_W": 8}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_H": 8, "BLOCK_W": 64}, num_stages=2, num_warps=4),
-    ],
-    key=[
-        "out_h",
-        "out_w",
-        "kernel_h",
-        "kernel_w",
-        "stride_h",
-        "stride_w",
-    ],
-)
-@triton.jit
-def max_pool2d_forward_kernel_dilated(
-    input_ptr,
-    output_ptr,
-    indices_ptr,
-    in_stride_n,
-    in_stride_c,
-    in_stride_h,
-    in_stride_w,
-    in_c,
-    in_h,
-    in_w,
-    out_h,
-    out_w,
-    kernel_h: tl.constexpr,
-    kernel_w: tl.constexpr,
-    stride_h: tl.constexpr,
-    stride_w: tl.constexpr,
-    padding_h: tl.constexpr,
-    padding_w: tl.constexpr,
-    dilation_h: tl.constexpr,
-    dilation_w: tl.constexpr,
-    BLOCK_H: tl.constexpr,
-    BLOCK_W: tl.constexpr,
-):
-    pid_nc = tl.program_id(0)
-    pid_hw = tl.program_id(1)
-    num_w_blocks = tl.cdiv(out_w, BLOCK_W)
-    h_block_idx = pid_hw // num_w_blocks
-    w_block_idx = pid_hw % num_w_blocks
-    n_idx = pid_nc // in_c
-    c_idx = pid_nc % in_c
-
-    h_out_offsets = h_block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
-    w_out_offsets = w_block_idx * BLOCK_W + tl.arange(0, BLOCK_W)
-
-    dtype = input_ptr.type.element_ty
-    min_in_f32 = float("-inf")
-    max_val_acc = tl.full((BLOCK_H, BLOCK_W), min_in_f32, dtype=tl.float32)
-    max_idx_acc = tl.full((BLOCK_H, BLOCK_W), -1, dtype=tl.int32)
-
-    input_base_ptr = input_ptr + n_idx * in_stride_n + c_idx * in_stride_c
-    for kh in tl.static_range(0, kernel_h):
-        for kw in tl.static_range(0, kernel_w):
-            h_in = h_out_offsets[:, None] * stride_h - padding_h + kh * dilation_h
-            w_in = w_out_offsets[None, :] * stride_w - padding_w + kw * dilation_w
-
-            h_in_safe = tl.maximum(0, tl.minimum(h_in, in_h - 1))
-            w_in_safe = tl.maximum(0, tl.minimum(w_in, in_w - 1))
-            safe_offset = h_in_safe * in_stride_h + w_in_safe * in_stride_w
-            raw_val = tl.load(input_base_ptr + safe_offset)
-            in_mask = (h_in >= 0) & (h_in < in_h) & (w_in >= 0) & (w_in < in_w)
-            raw_val_f32 = raw_val.to(tl.float32)
-            current_val_f32 = tl.where(in_mask, raw_val_f32, min_in_f32)
-            current_idx = (h_in * in_w + w_in).to(tl.int32)
-
-            is_new_max = current_val_f32 > max_val_acc
-            max_val_acc = tl.where(is_new_max, current_val_f32, max_val_acc)
-            max_idx_acc = tl.where(is_new_max, current_idx, max_idx_acc)
 
     out_base_ptr = output_ptr + pid_nc * out_h * out_w
     indices_base_ptr = indices_ptr + pid_nc * out_h * out_w
@@ -499,6 +454,7 @@ def _parse_pool_params(kernel_size, stride, padding, dilation):
         dilation_w,
     )
 
+
 def max_pool2d_with_indices(
     input: torch.Tensor,
     kernel_size,
@@ -507,7 +463,7 @@ def max_pool2d_with_indices(
     dilation=1,
     ceil_mode=False,
 ):
-    logger.debug("GEMS MAX_POOL2D_WITH_INDICES FORWARD (V12 — A+B+D)")
+    logger.debug("GEMS MAX_POOL2D_WITH_INDICES FORWARD")
     input = input.contiguous()
 
     params = _parse_pool_params(kernel_size, stride, padding, dilation)
@@ -545,14 +501,24 @@ def max_pool2d_with_indices(
     ), "Feature map elements exceed int32 representable range."
 
     out_hw = out_h * out_w
-    spatial_threshold = 64 if (dilation_h > 1 or dilation_w > 1) else 196
-    has_dilation = dilation_h > 1 or dilation_w > 1
-    if out_hw <= spatial_threshold:
-        total_channels = in_n * in_c
+    total_channels = in_n * in_c
 
-        BLOCK_HW = max(16, triton.next_power_of_2(out_hw))
+    # Channel-packed path: pack multiple channels per program so each program
+    # does enough work. Best for mid-size spatial outputs where the per-channel
+    # tiled kernel launches too many tiny programs, and for small outputs where
+    # 1-D parallelism alone cannot fill the GPU.
+    use_packed = (
+        out_hw <= 2048
+        and total_channels >= 512
+        # int32 offsets inside the packed kernel
+        and total_channels * in_h * in_w < 2147483647
+    )
 
-        grid = lambda meta: (triton.cdiv(total_channels, meta["BLOCK_C"]),)
+    if use_packed:
+        grid = lambda meta: (
+            triton.cdiv(total_channels, meta["BLOCK_C"]),
+            triton.cdiv(out_hw, meta["BLOCK_HW"]),
+        )
         max_pool2d_channel_packed_kernel[grid](
             input,
             output,
@@ -560,37 +526,8 @@ def max_pool2d_with_indices(
             total_channels,
             in_h,
             in_w,
-            out_h,
             out_w,
             out_hw,
-            kernel_h,
-            kernel_w,
-            stride_h,
-            stride_w,
-            padding_h,
-            padding_w,
-            dilation_h,
-            dilation_w,
-            BLOCK_HW=BLOCK_HW,
-        )
-    elif has_dilation:
-        grid = lambda meta: (
-            in_n * in_c,
-            triton.cdiv(out_h, meta["BLOCK_H"]) * triton.cdiv(out_w, meta["BLOCK_W"]),
-        )
-        max_pool2d_forward_kernel_dilated[grid](
-            input,
-            output,
-            indices,
-            input.stride(0),
-            input.stride(1),
-            input.stride(2),
-            input.stride(3),
-            in_c,
-            in_h,
-            in_w,
-            out_h,
-            out_w,
             kernel_h,
             kernel_w,
             stride_h,
@@ -629,6 +566,7 @@ def max_pool2d_with_indices(
         )
 
     return output, indices
+
 
 def max_pool2d_backward(
     grad_output: torch.Tensor,
@@ -696,6 +634,7 @@ def max_pool2d_backward(
 
     return grad_input.to(grad_output.dtype)
 
+
 def max_pool2d_with_indices_backward(
     grad_output: torch.Tensor,
     self: torch.Tensor,
@@ -706,7 +645,6 @@ def max_pool2d_with_indices_backward(
     ceil_mode: bool,
     indices: torch.Tensor,
 ):
-    """Wrapper matching the aten::max_pool2d_with_indices_backward schema."""
     logger.debug("GEMS MAX_POOL2D_WITH_INDICES_BACKWARD")
     return max_pool2d_backward(
         grad_output, self, indices, kernel_size, stride, padding, dilation, ceil_mode
